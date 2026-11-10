@@ -1,9 +1,9 @@
 # Talpa 🐹
 
-Strumenti gratuiti per liberare spazio e tenere in ordine un Mac vecchio.
+Strumento gratuito per liberare spazio e tenere in ordine un Mac vecchio.
 Ispirato a [Mole](https://github.com/tw93/Mole) di tw93 (GPL-3.0): non ne usa il codice, è scritto da zero.
 
-*English: free tools to clean up an older Mac (macOS Catalina 10.15, pure Bash, no dependencies). Documentation is in Italian; issues and pull requests in English are welcome.*
+*English: free tool to clean up an older Mac (macOS Catalina 10.15, pure Bash, no dependencies). Documentation is in Italian; issues and pull requests in English are welcome.*
 
 | Cartella | Cosa è | Stato |
 |---|---|---|
