@@ -1,0 +1,723 @@
+#!/bin/bash
+# Talpa - pulizia, disinstallazione, analisi e monitoraggio per macOS Catalina (10.15.x)
+# Ispirato a Mole (tw93/Mole), riscritto da zero in Bash 3.2 puro: nessuna dipendenza,
+# niente Go, niente Homebrew. Funziona con la bash e gli strumenti BSD inclusi in Catalina.
+# Licenza: GPL-3.0 (come il progetto che lo ha ispirato).
+
+TALPA_VERSION="1.0.0"
+
+if [ "$(uname -s)" != "Darwin" ] && [ "$TALPA_ALLOW_NON_MAC" != "1" ]; then
+  echo "Talpa funziona solo su macOS." >&2
+  exit 1
+fi
+if [ -z "$HOME" ] || [ "$HOME" = "/" ]; then
+  echo "HOME non valida: mi fermo per sicurezza." >&2
+  exit 1
+fi
+
+CONF_DIR="$HOME/.config/talpa"
+WHITELIST="$CONF_DIR/whitelist"
+PURGE_PATHS="$CONF_DIR/purge_paths"
+LOG_DIR="$HOME/Library/Logs/talpa"
+OPLOG="$LOG_DIR/operations.log"
+
+DRY=0
+ASSUME_YES=0
+DEBUG=0
+DEEP=0
+WATCH=0
+SKIP_APPLE=0
+
+if [ -t 1 ]; then
+  B=$'\033[1m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  B=""; R=""; G=""; Y=""; C=""; D=""; N=""
+fi
+
+# ---------------------------------------------------------------- utilita'
+
+title() { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+ok()    { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+warn()  { printf '  %s◎%s %s\n' "$Y" "$N" "$*"; }
+err()   { printf '  %s✗%s %s\n' "$R" "$N" "$*" >&2; }
+
+human() {
+  awk -v k="${1:-0}" 'BEGIN {
+    if (k < 1024) printf "%d KB", k;
+    else if (k < 1048576) printf "%.1f MB", k / 1024;
+    else printf "%.2f GB", k / 1048576 }'
+}
+
+size_kb() {
+  du -sk "$1" 2>/dev/null | awk '{ s = $1 } END { print s + 0 }'
+}
+
+data_volume() {
+  # Su Catalina "/" e' il volume di sistema (sola lettura): lo spazio utente sta qui.
+  if [ -d /System/Volumes/Data ]; then echo /System/Volumes/Data; else echo /; fi
+}
+
+free_kb() {
+  df -k "$(data_volume)" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }'
+}
+
+log_op() {
+  mkdir -p "$LOG_DIR" 2>/dev/null
+  printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$OPLOG" 2>/dev/null
+}
+
+confirm() {
+  [ "$ASSUME_YES" = 1 ] && return 0
+  local a
+  printf '%s [s/N] ' "$1"
+  read -r a
+  case "$a" in s|S|si|SI|Si|y|Y|yes) return 0 ;; esac
+  return 1
+}
+
+app_running() {
+  pgrep -x "$1" >/dev/null 2>&1
+}
+
+bar() {
+  local p="${1%.*}" w="${2:-20}" f i s=""
+  case "$p" in ''|*[!0-9]*) p=0 ;; esac
+  f=$(( p * w / 100 ))
+  [ "$f" -gt "$w" ] && f=$w
+  for (( i = 0; i < w; i++ )); do
+    if [ "$i" -lt "$f" ]; then s="$s█"; else s="$s░"; fi
+  done
+  printf '%s' "$s"
+}
+
+# ---------------------------------------------------------------- sicurezza
+
+# Lista bianca: un pattern (glob) per riga in ~/.config/talpa/whitelist. '~' viene espanso.
+is_whitelisted() {
+  [ -f "$WHITELIST" ] || return 1
+  local p
+  while IFS= read -r p; do
+    case "$p" in
+      ''|'#'*) continue ;;
+      '~'*) p="$HOME${p#\~}" ;;
+    esac
+    case "$1" in
+      $p) return 0 ;;
+    esac
+  done < "$WHITELIST"
+  return 1
+}
+
+# Rifiuta tutto cio' che non e' chiaramente un bersaglio di pulizia.
+path_is_safe() {
+  local p="$1"
+  [ -n "$p" ] || return 1
+  case "$p" in /*) ;; *) return 1 ;; esac
+  case "$p" in */../*|*/..|*/./*|*/.) return 1 ;; esac
+  case "$p" in
+    /|/System*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/etc|/etc/*|/private/etc|/private/etc/*|/Library|/Users|/Applications|/Volumes|/cores|/opt)
+      return 1 ;;
+    "$HOME"|"$HOME/"|"$HOME/Library"|"$HOME/Library/"|"$HOME/Documents"|"$HOME/Desktop"|"$HOME/Downloads"|"$HOME/Pictures"|"$HOME/Music"|"$HOME/Movies"|"$HOME/Public"|"$HOME/.Trash")
+      return 1 ;;
+  esac
+  case "$p" in
+    "$HOME"/*|/Applications/*|/Library/Caches/*|/Library/Logs/*|/private/tmp/*) return 0 ;;
+  esac
+  return 1
+}
+
+move_to_trash() {
+  local p="$1" base dest
+  base="$(basename "$p")"
+  dest="$HOME/.Trash/$base"
+  [ -e "$dest" ] && dest="$HOME/.Trash/$base.$(date +%H%M%S)"
+  if mv "$p" "$dest" 2>/dev/null; then return 0; fi
+  case "$p" in
+    /Applications/*) sudo mv "$p" "$dest" ;;
+    *) return 1 ;;
+  esac
+}
+
+# $1 = percorso, $2 = rm (definitivo, default) | trash (sposta nel Cestino)
+remove_item() {
+  local p="$1" mode="${2:-rm}"
+  if ! path_is_safe "$p"; then warn "Saltato (percorso protetto): $p"; return 1; fi
+  is_whitelisted "$p" && return 0
+  { [ -e "$p" ] || [ -L "$p" ]; } || return 0
+  [ "$DRY" = 1 ] && return 0
+  if [ "$mode" = trash ]; then
+    move_to_trash "$p"
+  else
+    rm -rf "$p" 2>/dev/null
+  fi
+}
+
+# ---------------------------------------------------------------- selezione da lista
+
+LP=(); LK=(); LX=(); LD=()
+PICKED=()
+
+# Mostra LP/LK/LX e legge la scelta in PICKED (indici). LD[i]=1 -> "recente", escluso da "a".
+pick() {
+  local i=0 n="${#LP[@]}" ans tok
+  PICKED=()
+  [ "$n" -gt 0 ] || return 1
+  while [ "$i" -lt "$n" ]; do
+    printf '  %2d) %10s  %s %s\n' $(( i + 1 )) "$(human "${LK[$i]}")" "${LP[$i]}" "${LX[$i]}"
+    i=$(( i + 1 ))
+  done
+  printf 'Numeri separati da spazio, "a" = tutti tranne i recenti, "t" = tutti, invio = annulla: '
+  read -r ans
+  case "$ans" in
+    ''|q|Q) return 1 ;;
+    t|T) i=0; while [ "$i" -lt "$n" ]; do PICKED[${#PICKED[@]}]=$i; i=$(( i + 1 )); done ;;
+    a|A) i=0; while [ "$i" -lt "$n" ]; do
+           [ "${LD[$i]}" = 1 ] || PICKED[${#PICKED[@]}]=$i
+           i=$(( i + 1 ))
+         done ;;
+    *)
+      for tok in $ans; do
+        case "$tok" in
+          ''|*[!0-9]*) warn "Ignorato: $tok"; continue ;;
+        esac
+        if [ "$tok" -ge 1 ] && [ "$tok" -le "$n" ]; then
+          PICKED[${#PICKED[@]}]=$(( tok - 1 ))
+        else
+          warn "Numero fuori elenco: $tok"
+        fi
+      done ;;
+  esac
+  [ "${#PICKED[@]}" -gt 0 ]
+}
+
+# ---------------------------------------------------------------- clean
+
+CL_P=(); CL_K=(); CL_L=()
+
+cand() {   # $1 etichetta, $2 percorso
+  local lbl="$1" p="$2" s n
+  [ -e "$p" ] || return 0
+  path_is_safe "$p" || return 0
+  is_whitelisted "$p" && return 0
+  s=$(size_kb "$p")
+  [ "$s" -gt 0 ] 2>/dev/null || return 0
+  n=${#CL_P[@]}
+  CL_P[$n]="$p"; CL_K[$n]="$s"; CL_L[$n]="$lbl"
+}
+
+cand_children() {   # $1 etichetta, $2 cartella
+  local lbl="$1" d="$2" c name
+  [ -d "$d" ] || return 0
+  while IFS= read -r -d '' c; do
+    name="$(basename "$c")"
+    if [ "$SKIP_APPLE" = 1 ]; then
+      case "$name" in
+        com.apple.Safari)
+          app_running Safari && { warn "Safari aperto: cache saltata"; continue; } ;;
+        com.apple.dt.Xcode) ;;
+        com.apple.*|CloudKit|FamilyCircle) continue ;;
+        Google)
+          app_running "Google Chrome" && { warn "Chrome aperto: cache saltata"; continue; } ;;
+        Firefox|org.mozilla.firefox)
+          app_running firefox && { warn "Firefox aperto: cache saltata"; continue; } ;;
+      esac
+    fi
+    cand "$lbl" "$c"
+  done < <(find "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+}
+
+cmd_clean() {
+  title "Pulizia del Mac"
+  local before after i n sum count lbl total=0 freed=0 done_n=0
+  CL_P=(); CL_K=(); CL_L=()
+  printf '%sAnalisi in corso...%s\n' "$D" "$N"
+
+  SKIP_APPLE=1; cand_children "Cache app" "$HOME/Library/Caches"; SKIP_APPLE=0
+  cand_children "Log" "$HOME/Library/Logs"
+  cand_children "Cestino" "$HOME/.Trash"
+  cand_children "Sviluppo" "$HOME/Library/Developer/Xcode/DerivedData"
+  cand "Sviluppo" "$HOME/Library/Developer/CoreSimulator/Caches"
+  cand "Sviluppo" "$HOME/.npm/_cacache"
+  cand "Altro" "$HOME/Library/iTunes/iPhone Software Updates"
+  cand_children "Altro" "$HOME/Library/Containers/com.apple.mail/Data/Library/Mail Downloads"
+
+  n=${#CL_P[@]}
+  if [ "$n" -eq 0 ]; then
+    ok "Niente da pulire (o accesso negato: dai il Controllo completo del disco al Terminale)."
+    return 0
+  fi
+
+  for lbl in "Cache app" "Log" "Cestino" "Sviluppo" "Altro"; do
+    sum=0; count=0; i=0
+    while [ "$i" -lt "$n" ]; do
+      if [ "${CL_L[$i]}" = "$lbl" ]; then
+        sum=$(( sum + CL_K[i] )); count=$(( count + 1 ))
+        [ "$DEBUG" = 1 ] && printf '      %s%10s  %s%s\n' "$D" "$(human "${CL_K[$i]}")" "${CL_P[$i]}" "$N"
+      fi
+      i=$(( i + 1 ))
+    done
+    if [ "$count" -gt 0 ]; then
+      printf '  %-12s %3d elementi  %10s\n' "$lbl" "$count" "$(human "$sum")"
+      total=$(( total + sum ))
+    fi
+  done
+  printf '\n  %sRecuperabili: %s%s\n' "$B" "$(human "$total")" "$N"
+
+  if [ "$DRY" = 1 ]; then
+    printf '\n%sModalita'"'"' prova: non e'"'"' stato cancellato nulla.%s\n' "$Y" "$N"
+    return 0
+  fi
+  confirm "Cancello questi $n elementi?" || { echo "Annullato."; return 0; }
+
+  before=$(free_kb)
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if remove_item "${CL_P[$i]}" rm; then
+      freed=$(( freed + CL_K[i] )); done_n=$(( done_n + 1 ))
+      log_op clean "${CL_P[$i]}"
+    fi
+    i=$(( i + 1 ))
+  done
+  after=$(free_kb)
+  printf '\n%s======================================%s\n' "$G" "$N"
+  printf 'Pulizia completata: %d elementi, circa %s\n' "$done_n" "$(human "$freed")"
+  printf 'Spazio libero: %s (%+d KB)\n' "$(human "$after")" $(( after - before ))
+  printf '%s======================================%s\n' "$G" "$N"
+}
+
+# ---------------------------------------------------------------- uninstall
+
+bundle_id() {
+  /usr/bin/defaults read "$1/Contents/Info" CFBundleIdentifier 2>/dev/null
+}
+
+cmd_uninstall() {
+  title "Disinstalla app"
+  local d app bid kb i n idx name L sub rem total
+  LP=(); LK=(); LX=(); LD=()
+  for d in /Applications "$HOME/Applications"; do
+    [ -d "$d" ] || continue
+    while IFS= read -r -d '' app; do
+      bid="$(bundle_id "$app")"
+      case "$bid" in com.apple.*) continue ;; esac
+      kb=$(size_kb "$app")
+      n=${#LP[@]}
+      LP[$n]="$app"; LK[$n]="$kb"; LX[$n]="${D}${bid}${N}"; LD[$n]=0
+    done < <(find "$d" -mindepth 1 -maxdepth 1 -name '*.app' -print0 2>/dev/null)
+  done
+  if [ "${#LP[@]}" -eq 0 ]; then warn "Nessuna app di terze parti trovata."; return 0; fi
+
+  pick || { echo "Annullato."; return 0; }
+
+  for idx in "${PICKED[@]}"; do
+    app="${LP[$idx]}"
+    name="$(basename "$app" .app)"
+    bid="$(bundle_id "$app")"
+    printf '\n%s%s%s\n' "$B" "$name" "$N"
+    if pgrep -f "$app/Contents/MacOS" >/dev/null 2>&1; then
+      warn "L'app e' in esecuzione: chiudila e riprova. Saltata."
+      continue
+    fi
+    rem=("$app"); total=$(size_kb "$app")
+    if [ -n "$bid" ] && [ "${bid#*.}" != "$bid" ]; then
+      L="$HOME/Library"
+      for sub in "Application Support" Caches Preferences Logs "Saved Application State" Containers LaunchAgents Cookies HTTPStorages WebKit; do
+        [ -d "$L/$sub" ] || continue
+        while IFS= read -r -d '' d; do
+          rem[${#rem[@]}]="$d"
+        done < <(find "$L/$sub" -mindepth 1 -maxdepth 1 \( -name "$bid" -o -name "$bid.*" \) -print0 2>/dev/null)
+      done
+      # Cartelle con il nome dell'app (solo nomi abbastanza specifici)
+      if [ "${#name}" -ge 5 ]; then
+        for sub in "Application Support" Caches Logs; do
+          [ -d "$L/$sub/$name" ] && rem[${#rem[@]}]="$L/$sub/$name"
+        done
+      fi
+    else
+      warn "Identificativo app non trovato: rimuovo solo l'app."
+    fi
+    printf '  Verranno spostati nel Cestino:\n'
+    for d in "${rem[@]}"; do
+      path_is_safe "$d" || { printf '    %s(protetto, saltato)%s %s\n' "$R" "$N" "$d"; continue; }
+      printf '    %s\n' "$d"
+    done
+    [ "$DRY" = 1 ] && continue
+    confirm "Spostare nel Cestino?" || continue
+    for d in "${rem[@]}"; do
+      remove_item "$d" trash && log_op uninstall "$d"
+    done
+    ok "$name rimossa"
+  done
+  [ "$DRY" = 1 ] && printf '\n%sModalita'"'"' prova: non e'"'"' stato spostato nulla.%s\n' "$Y" "$N"
+}
+
+# ---------------------------------------------------------------- optimize
+
+task_dns()   { sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder; }
+task_ql()    { qlmanage -r cache && qlmanage -r; }
+task_dock()  { rm -f "$(getconf DARWIN_USER_CACHE_DIR)com.apple.dock.iconcache" && killall Dock; }
+task_purge() { sudo purge; }
+task_periodic() { sudo periodic daily weekly monthly; }
+task_lsreg() {
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -kill -r -domain local -domain system -domain user && killall Finder
+}
+
+run_task() {   # $1 descrizione, resto = comando
+  local desc="$1"; shift
+  if [ "$DRY" = 1 ]; then printf '  %s[prova]%s %s\n' "$Y" "$N" "$desc"; return 0; fi
+  if "$@" >/dev/null 2>&1; then
+    ok "$desc"; log_op optimize "$desc"
+  else
+    warn "$desc (non riuscito o non disponibile)"
+  fi
+}
+
+cmd_optimize() {
+  title "Ottimizzazione"
+  if [ "$DRY" != 1 ]; then
+    echo "Alcune operazioni richiedono la password di amministratore."
+    sudo -v || { err "Password non valida."; return 1; }
+  fi
+  run_task "Svuota la cache DNS" task_dns
+  run_task "Aggiorna le anteprime Quick Look" task_ql
+  run_task "Ricostruisci la cache delle icone del Dock" task_dock
+  run_task "Libera la memoria inattiva (purge)" task_purge
+  run_task "Esegui gli script di manutenzione periodici" task_periodic
+  if [ "$DEEP" = 1 ]; then
+    run_task "Ricostruisci il database di Launch Services (Apri con...)" task_lsreg
+  else
+    printf '  %s(usa --deep per ricostruire anche Launch Services)%s\n' "$D" "$N"
+  fi
+  [ "$DRY" = 1 ] && printf '\n%sModalita'"'"' prova: non e'"'"' stato eseguito nulla.%s\n' "$Y" "$N"
+}
+
+# ---------------------------------------------------------------- analyze
+
+AN_P=(); AN_K=()
+
+cmd_analyze() {
+  local cur="${1:-$HOME}" ans i n kb path max w name idx
+  cur="${cur%/}"; [ -z "$cur" ] && cur=/
+  [ -d "$cur" ] || { err "Cartella non trovata: $cur"; return 1; }
+  while true; do
+    AN_P=(); AN_K=()
+    printf '%sAnalisi di %s...%s\n' "$D" "$cur" "$N"
+    while IFS=$'\t' read -r kb path; do
+      [ "$path" = "$cur" ] && continue
+      AN_K[${#AN_K[@]}]="$kb"; AN_P[${#AN_P[@]}]="$path"
+    done < <(du -a -k -d 1 "$cur" 2>/dev/null | sort -rn | sed -n '1,26p')
+    title "Analisi disco: $cur   (libero: $(human "$(free_kb)"))"
+    n=${#AN_P[@]}
+    max=${AN_K[0]:-1}; [ "$max" -gt 0 ] || max=1
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      name="$(basename "${AN_P[$i]}")"
+      [ -d "${AN_P[$i]}" ] && name="$name/"
+      w=$(( AN_K[i] * 100 / max ))
+      printf ' %2d) %s %10s  %s\n' $(( i + 1 )) "$(bar "$w" 16)" "$(human "${AN_K[$i]}")" "$name"
+      i=$(( i + 1 ))
+    done
+    printf '\n%s[numero] apri  [u] su  [d N] cestino  [f] file grandi  [q] esci%s\n> ' "$D" "$N"
+    read -r ans || break
+    case "$ans" in
+      q|Q|'') break ;;
+      u) cur="$(dirname "$cur")" ;;
+      f)
+        title "File oltre 200 MB in $cur"
+        find "$cur" -xdev -type f -size +200M -exec du -k {} + 2>/dev/null | sort -rn | head -15 \
+          | while IFS=$'\t' read -r kb path; do printf '  %10s  %s\n' "$(human "$kb")" "$path"; done
+        printf 'Invio per continuare...'; read -r ans ;;
+      d\ *)
+        idx="${ans#d }"
+        case "$idx" in ''|*[!0-9]*) warn "Uso: d NUMERO"; continue ;; esac
+        if [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ]; then
+          path="${AN_P[$(( idx - 1 ))]}"
+          if confirm "Spostare nel Cestino: $path ?"; then
+            remove_item "$path" trash && { ok "Spostato"; log_op analyze-trash "$path"; }
+          fi
+        fi ;;
+      *[!0-9]*) warn "Comando non riconosciuto." ;;
+      *)
+        if [ "$ans" -ge 1 ] && [ "$ans" -le "$n" ]; then
+          if [ -d "${AN_P[$(( ans - 1 ))]}" ]; then cur="${AN_P[$(( ans - 1 ))]}"
+          else warn "E' un file, non una cartella."; fi
+        fi ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- status
+
+net_bytes() {   # stampa "in out" dell'interfaccia predefinita
+  local ifc
+  ifc=$(route get default 2>/dev/null | awk '/interface:/ { print $2 }')
+  [ -n "$ifc" ] || { echo "0 0"; return; }
+  netstat -ib -I "$ifc" 2>/dev/null | awk 'NR == 2 { print $7 + 0, $10 + 0 }'
+}
+
+render_status() {
+  local host model cpu_brand ncpu macos memtotal mem_used mem_pct cpu_pct disk_line disk_pct
+  local disk_used disk_total batt cycles load up zombies score n1 n2 in1 out1 in2 out2 rin rout
+  host=$(scutil --get ComputerName 2>/dev/null || hostname)
+  model=$(sysctl -n hw.model 2>/dev/null)
+  cpu_brand=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+  ncpu=$(sysctl -n hw.ncpu 2>/dev/null)
+  macos=$(sw_vers -productVersion 2>/dev/null)
+  memtotal=$(sysctl -n hw.memsize 2>/dev/null)
+
+  n1=$(net_bytes); in1=${n1% *}; out1=${n1#* }
+  cpu_pct=$(top -l 2 -n 0 -s 1 2>/dev/null | awk '/CPU usage/ { v = 100 - $7 } END { printf "%.1f", v + 0 }')
+  n2=$(net_bytes); in2=${n2% *}; out2=${n2#* }
+  rin=$(( (in2 - in1) / 1024 )); rout=$(( (out2 - out1) / 1024 ))
+  [ "$rin" -lt 0 ] && rin=0; [ "$rout" -lt 0 ] && rout=0
+
+  mem_used=$(vm_stat 2>/dev/null | awk '
+    /page size of/ { ps = $8 }
+    /Pages active/ { a = $3 }
+    /Pages wired down/ { w = $4 }
+    /Pages occupied by compressor/ { c = $5 }
+    END { printf "%.0f", (a + w + c) * ps }')
+  mem_pct=$(awk -v u="${mem_used:-0}" -v t="${memtotal:-1}" 'BEGIN { printf "%.1f", u * 100 / t }')
+
+  disk_line=$(df -k "$(data_volume)" 2>/dev/null | awk 'NR == 2 { print $2, $3, $5 }')
+  disk_total=${disk_line%% *}; disk_used=$(echo "$disk_line" | awk '{ print $2 }'); disk_pct=$(echo "$disk_line" | awk '{ gsub("%", "", $3); print $3 + 0 }')
+
+  batt=$(pmset -g batt 2>/dev/null | grep -o '[0-9]*%' | head -1)
+  cycles=$(ioreg -rn AppleSmartBattery 2>/dev/null | awk -F= '/"CycleCount"/ { print $2 + 0; exit }')
+  load=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1, $2, $3 }')
+  up=$(uptime 2>/dev/null | sed 's/.*up *//; s/, *[0-9]* user.*//')
+  zombies=$(ps -axo stat= 2>/dev/null | grep -c '^Z')
+
+  score=100
+  awk -v c="$cpu_pct" 'BEGIN { exit !(c > 85) }' && score=$(( score - 20 ))
+  awk -v m="$mem_pct" 'BEGIN { exit !(m > 85) }' && score=$(( score - 20 ))
+  [ "${disk_pct:-0}" -gt 90 ] && score=$(( score - 25 ))
+  [ "${disk_pct:-0}" -gt 80 ] && [ "${disk_pct:-0}" -le 90 ] && score=$(( score - 10 ))
+  [ "${zombies:-0}" -gt 5 ] && score=$(( score - 5 ))
+
+  printf '%sTalpa Status%s  Salute %s%d%s   %s · %s · macOS %s\n\n' "$B" "$N" "$G" "$score" "$N" "$host" "$model" "$macos"
+  printf '%sCPU%s     %s %5s%%   %s (%s core)\n' "$C" "$N" "$(bar "$cpu_pct" 24)" "$cpu_pct" "$cpu_brand" "$ncpu"
+  printf '        carico %s\n' "$load"
+  printf '%sMemoria%s %s %5s%%   %s / %s\n' "$C" "$N" "$(bar "$mem_pct" 24)" "$mem_pct" \
+    "$(human $(( ${mem_used:-0} / 1024 )))" "$(human $(( ${memtotal:-0} / 1024 )))"
+  printf '%sDisco%s   %s %5s%%   %s usati su %s\n' "$C" "$N" "$(bar "${disk_pct:-0}" 24)" "${disk_pct:-0}" \
+    "$(human "${disk_used:-0}")" "$(human "${disk_total:-0}")"
+  printf '%sRete%s    giu %d KB/s   su %d KB/s\n' "$C" "$N" "$rin" "$rout"
+  [ -n "$batt" ] && printf '%sBatteria%s %s%s\n' "$C" "$N" "$batt" "${cycles:+ · $cycles cicli}"
+  printf '%sUptime%s  %s   zombie: %s\n' "$C" "$N" "$up" "$zombies"
+  printf '\n%sProcessi piu'"'"' attivi%s\n' "$B" "$N"
+  ps -Aro pid,pcpu,pmem,comm 2>/dev/null | sed -n '2,7p' | awk '{
+    n = split($4, a, "/"); printf "  %6s  CPU %5s%%  MEM %5s%%  %s\n", $1, $2, $3, a[n] }'
+}
+
+cmd_status() {
+  if [ "$WATCH" = 1 ]; then
+    while true; do clear; render_status; sleep 2; done
+  else
+    render_status
+  fi
+}
+
+# ---------------------------------------------------------------- purge
+
+purge_valid() {
+  local d="$1" b parent
+  b="$(basename "$d")"; parent="$(dirname "$d")"
+  case "$b" in
+    node_modules) return 0 ;;
+    target) [ -f "$parent/Cargo.toml" ] ;;
+    .build) [ -f "$parent/Package.swift" ] ;;
+    Pods) [ -f "$parent/Podfile" ] ;;
+    build|dist)
+      [ -f "$parent/package.json" ] || [ -f "$parent/setup.py" ] || [ -f "$parent/pyproject.toml" ] ||
+      [ -f "$parent/build.gradle" ] || [ -f "$parent/pom.xml" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_purge() {
+  title "Artefatti di progetto (node_modules, target, build, dist, Pods...)"
+  local roots r d kb recent n idx total=0
+  roots=()
+  if [ -f "$PURGE_PATHS" ]; then
+    while IFS= read -r r; do
+      case "$r" in ''|'#'*) continue ;; '~'*) r="$HOME${r#\~}" ;; esac
+      [ -d "$r" ] && roots[${#roots[@]}]="$r"
+    done < "$PURGE_PATHS"
+  else
+    for r in "$HOME/Projects" "$HOME/GitHub" "$HOME/dev" "$HOME/Developer" "$HOME/Sites" "$HOME/code"; do
+      [ -d "$r" ] && roots[${#roots[@]}]="$r"
+    done
+  fi
+  if [ "${#roots[@]}" -eq 0 ]; then
+    warn "Nessuna cartella progetti trovata. Scrivi i percorsi (uno per riga) in $PURGE_PATHS"
+    return 0
+  fi
+  LP=(); LK=(); LX=(); LD=()
+  printf '%sScansione in corso...%s\n' "$D" "$N"
+  for r in "${roots[@]}"; do
+    while IFS= read -r -d '' d; do
+      purge_valid "$d" || continue
+      is_whitelisted "$d" && continue
+      kb=$(size_kb "$d"); [ "$kb" -gt 0 ] || continue
+      recent=0
+      if find "$d" -maxdepth 2 -type f -mtime -7 2>/dev/null | head -n 1 | grep -q .; then recent=1; fi
+      n=${#LP[@]}
+      LP[$n]="$d"; LK[$n]="$kb"; LD[$n]=$recent
+      if [ "$recent" = 1 ]; then LX[$n]="${Y}(attivita' negli ultimi 7 giorni)${N}"; else LX[$n]=""; fi
+    done < <(find "$r" -maxdepth 5 -type d \( -name node_modules -o -name target -o -name .build -o -name Pods -o -name build -o -name dist \) -prune -print0 2>/dev/null)
+  done
+  if [ "${#LP[@]}" -eq 0 ]; then ok "Nessun artefatto trovato."; return 0; fi
+
+  if [ "$DRY" = 1 ]; then
+    n=0; while [ "$n" -lt "${#LP[@]}" ]; do
+      printf '  %10s  %s %s\n' "$(human "${LK[$n]}")" "${LP[$n]}" "${LX[$n]}"
+      total=$(( total + LK[n] )); n=$(( n + 1 ))
+    done
+    printf '\n  %sRecuperabili: %s%s\n%sModalita'"'"' prova: non e'"'"' stato cancellato nulla.%s\n' "$B" "$(human "$total")" "$N" "$Y" "$N"
+    return 0
+  fi
+  pick || { echo "Annullato."; return 0; }
+  for idx in "${PICKED[@]}"; do total=$(( total + LK[idx] )); done
+  confirm "Cancellare DEFINITIVAMENTE ${#PICKED[@]} cartelle ($(human "$total"))?" || { echo "Annullato."; return 0; }
+  for idx in "${PICKED[@]}"; do
+    if remove_item "${LP[$idx]}" rm; then ok "${LP[$idx]}"; log_op purge "${LP[$idx]}"; else warn "Non riuscito: ${LP[$idx]}"; fi
+  done
+  ok "Liberati circa $(human "$total")"
+}
+
+# ---------------------------------------------------------------- installer
+
+cmd_installer() {
+  title "File di installazione (dmg, pkg, mpkg, iso, xip)"
+  local d f kb n idx total=0 where
+  LP=(); LK=(); LX=(); LD=()
+  for d in "$HOME/Downloads" "$HOME/Desktop" "$HOME/Library/Caches/Homebrew/downloads"; do
+    [ -d "$d" ] || continue
+    where="$(basename "$d")"
+    while IFS= read -r -d '' f; do
+      is_whitelisted "$f" && continue
+      kb=$(size_kb "$f")
+      n=${#LP[@]}
+      LP[$n]="$f"; LK[$n]="$kb"; LX[$n]="${D}[$where]${N}"; LD[$n]=0
+    done < <(find "$d" -maxdepth 2 -type f \( -iname '*.dmg' -o -iname '*.pkg' -o -iname '*.mpkg' -o -iname '*.iso' -o -iname '*.xip' \) -print0 2>/dev/null)
+  done
+  if [ "${#LP[@]}" -eq 0 ]; then ok "Nessun file di installazione trovato."; return 0; fi
+  if [ "$DRY" = 1 ]; then
+    n=0; while [ "$n" -lt "${#LP[@]}" ]; do
+      printf '  %10s  %s %s\n' "$(human "${LK[$n]}")" "${LP[$n]}" "${LX[$n]}"
+      total=$(( total + LK[n] )); n=$(( n + 1 ))
+    done
+    printf '\n  %sRecuperabili: %s%s\n%sModalita'"'"' prova: non e'"'"' stato spostato nulla.%s\n' "$B" "$(human "$total")" "$N" "$Y" "$N"
+    return 0
+  fi
+  pick || { echo "Annullato."; return 0; }
+  for idx in "${PICKED[@]}"; do total=$(( total + LK[idx] )); done
+  confirm "Spostare nel Cestino ${#PICKED[@]} file ($(human "$total"))?" || { echo "Annullato."; return 0; }
+  for idx in "${PICKED[@]}"; do
+    if remove_item "${LP[$idx]}" trash; then ok "${LP[$idx]}"; log_op installer "${LP[$idx]}"; else warn "Non riuscito: ${LP[$idx]}"; fi
+  done
+}
+
+# ---------------------------------------------------------------- varie
+
+cmd_whitelist() {
+  mkdir -p "$CONF_DIR"
+  if [ ! -f "$WHITELIST" ]; then
+    printf '# Un percorso (o pattern con *) per riga. Questi elementi non verranno mai toccati.\n# Esempio:\n# ~/Library/Caches/com.spotify.client\n' > "$WHITELIST"
+  fi
+  echo "File: $WHITELIST"
+  "${EDITOR:-nano}" "$WHITELIST"
+}
+
+cmd_history() {
+  if [ -f "$OPLOG" ]; then tail -n 40 "$OPLOG"; else echo "Nessuna operazione registrata."; fi
+}
+
+cmd_remove() {
+  local me
+  me="$(command -v talpa 2>/dev/null)"
+  [ -n "$me" ] || { warn "Talpa non risulta installato nel PATH."; return 1; }
+  confirm "Rimuovere $me e la configurazione in $CONF_DIR?" || return 0
+  rm -f "$me" && rm -rf "$CONF_DIR" && ok "Talpa rimosso."
+}
+
+usage() {
+  cat <<EOF
+${B}Talpa $TALPA_VERSION${N} - manutenzione per macOS Catalina (10.15.x)
+
+Uso: talpa [comando] [opzioni]
+
+Comandi
+  clean        Pulisce cache, log, Cestino e cache di sviluppo
+  uninstall    Rimuove le app e i loro resti (sposta nel Cestino)
+  optimize     Svuota DNS, aggiorna cache di sistema, libera memoria
+  analyze [d]  Esplora lo spazio su disco (default: la tua cartella utente)
+  status       Cruscotto con CPU, memoria, disco, rete, batteria
+  purge        Elimina node_modules, target, build, dist, Pods dei progetti
+  installer    Trova e rimuove dmg, pkg, iso, xip scaricati
+  whitelist    Modifica l'elenco dei percorsi protetti
+  history      Mostra le ultime operazioni registrate
+  remove       Rimuove Talpa dal Mac
+
+Opzioni
+  -n, --dry-run   Mostra cosa farebbe senza toccare nulla (consigliato la prima volta)
+  -y, --yes       Non chiedere conferma
+  --debug         Elenca ogni elemento in "clean"
+  --deep          Con "optimize": ricostruisce anche Launch Services
+  --watch         Con "status": aggiorna ogni 2 secondi
+  -v, --version   Versione
+  -h, --help      Questo aiuto
+EOF
+}
+
+menu() {
+  local c
+  while true; do
+    printf '\n%sTalpa%s - cosa vuoi fare?\n' "$B" "$N"
+    printf '  1) Pulizia          2) Disinstalla app   3) Ottimizza\n'
+    printf '  4) Analizza disco   5) Stato sistema     6) Purge progetti\n'
+    printf '  7) Installer        0) Esci\n> '
+    read -r c || break
+    case "$c" in
+      1) cmd_clean ;; 2) cmd_uninstall ;; 3) cmd_optimize ;;
+      4) cmd_analyze ;; 5) cmd_status ;; 6) cmd_purge ;; 7) cmd_installer ;;
+      0|q|'') break ;;
+      *) warn "Scelta non valida." ;;
+    esac
+  done
+}
+
+main() {
+  local cmd="" arg rest=()
+  for arg in "$@"; do
+    case "$arg" in
+      -n|--dry-run) DRY=1 ;;
+      -y|--yes) ASSUME_YES=1 ;;
+      --debug) DEBUG=1 ;;
+      --deep) DEEP=1 ;;
+      --watch) WATCH=1 ;;
+      -v|--version) echo "Talpa $TALPA_VERSION"; return 0 ;;
+      -h|--help|help) usage; return 0 ;;
+      -*) err "Opzione sconosciuta: $arg"; usage; return 1 ;;
+      *) if [ -z "$cmd" ]; then cmd="$arg"; else rest[${#rest[@]}]="$arg"; fi ;;
+    esac
+  done
+  case "$cmd" in
+    '') menu ;;
+    clean) cmd_clean ;;
+    uninstall) cmd_uninstall ;;
+    optimize) cmd_optimize ;;
+    analyze|analyse) cmd_analyze "${rest[0]}" ;;
+    status) cmd_status ;;
+    purge) cmd_purge ;;
+    installer) cmd_installer ;;
+    whitelist) cmd_whitelist ;;
+    history) cmd_history ;;
+    remove) cmd_remove ;;
+    *) err "Comando sconosciuto: $cmd"; usage; return 1 ;;
+  esac
+}
+
+main "$@"
